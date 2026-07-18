@@ -31,12 +31,13 @@ test("server-renders Andy's Macro Counter shell", async () => {
   const html = await response.text();
   assert.match(html, /<title>Andy&#x27;s Macro Counter<\/title>/i);
   assert.match(html, /Andy(?:'|&#x27;|&apos;)s Macro Counter/);
+  assert.match(html, /Fast macro logging/);
   assert.match(html, /Siggis Yogurt/);
   assert.match(html, /Today/);
   assert.match(html, /Foods/);
   assert.match(html, /Week/);
   assert.match(html, /Targets/);
-  assert.match(html, /Saved Foods/);
+  assert.match(html, /Quick Add/);
   assert.match(html, /Today&#x27;s Foods/);
   assert.match(html, /manifest\.webmanifest/);
   assert.doesNotMatch(html, /codex-preview|SkeletonPreview|react-loading-skeleton/);
@@ -53,6 +54,8 @@ test("keeps product sources free of starter preview code", async () => {
   assert.match(page, /STORAGE_KEY = "andys-macro-counter:v1"/);
   assert.match(page, /type TabKey = "today" \| "foods" \| "week" \| "targets"/);
   assert.match(page, /className="tab-bar"/);
+  assert.match(page, /className="today-hero"/);
+  assert.match(page, /quick-food-grid/);
   assert.match(page, /status-toast/);
   assert.match(page, /DEFAULT_FOODS/);
   assert.match(page, /Weekly Totals/);
