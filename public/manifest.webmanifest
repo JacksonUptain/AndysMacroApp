@@ -1,14 +1,15 @@
 {
   "name": "Andy's Macro Counter",
   "short_name": "Andy's Macros",
-  "description": "A simple local-first macro counter for calories, carbohydrates, fats, and protein.",
-  "start_url": "/",
+  "description": "A personal macro counter for calories, carbohydrates, fats, and protein.",
+  "start_url": ".",
+  "scope": ".",
   "display": "standalone",
   "background_color": "#f5f7f4",
   "theme_color": "#28795f",
   "icons": [
     {
-      "src": "/favicon.svg",
+      "src": "favicon.svg",
       "sizes": "any",
       "type": "image/svg+xml",
       "purpose": "any maskable"

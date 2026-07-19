@@ -1,11 +1,28 @@
 "use client";
 
 import type { FormEvent } from "react";
+import type { User } from "firebase/auth";
+import {
+  getRedirectResult,
+  onAuthStateChanged,
+  signInWithPopup,
+  signInWithRedirect,
+  signOut,
+} from "firebase/auth";
+import { onValue, ref, set } from "firebase/database";
 import { useEffect, useMemo, useState } from "react";
+import {
+  firebaseAuth,
+  firebaseDatabase,
+  googleAuthProvider,
+  initializeFirebaseAnalytics,
+} from "./firebase";
 
 type MacroKey = "calories" | "carbs" | "fat" | "protein";
-type TabKey = "today" | "foods" | "week" | "targets";
+type TabKey = "stats" | "add";
+type PeriodKey = "day" | "week" | "month";
 type NoticeTone = "success" | "error";
+type SyncState = "checking" | "signedOut" | "loading" | "saving" | "saved" | "error";
 
 type MacroValues = Record<MacroKey, number>;
 
@@ -32,13 +49,25 @@ type Notice = {
   tone: NoticeTone;
 };
 
-const STORAGE_KEY = "andys-macro-counter:v1";
+type MacroState = {
+  foods: Food[];
+  entries: LogEntry[];
+};
 
-const TABS: Array<{ key: TabKey; label: string; summary: string }> = [
-  { key: "today", label: "Today", summary: "Quick log" },
-  { key: "foods", label: "Foods", summary: "Build library" },
-  { key: "week", label: "Week", summary: "Review" },
-  { key: "targets", label: "Targets", summary: "Goals" },
+type RemoteMacroState = {
+  needsRepair: boolean;
+  state: MacroState;
+};
+
+const TABS: Array<{ key: TabKey; label: string }> = [
+  { key: "add", label: "Add" },
+  { key: "stats", label: "Stats" },
+];
+
+const PERIODS: Array<{ key: PeriodKey; label: string }> = [
+  { key: "day", label: "Day" },
+  { key: "week", label: "Week" },
+  { key: "month", label: "Month" },
 ];
 
 const MACRO_FIELDS: Array<{
@@ -48,8 +77,8 @@ const MACRO_FIELDS: Array<{
   unit: string;
 }> = [
   { key: "calories", label: "Calories", shortLabel: "Cal", unit: "" },
-  { key: "protein", label: "Protein", shortLabel: "Pro", unit: "g" },
-  { key: "carbs", label: "Carbohydrates", shortLabel: "Carb", unit: "g" },
+  { key: "protein", label: "Protein", shortLabel: "Protein", unit: "g" },
+  { key: "carbs", label: "Carbs", shortLabel: "Carbs", unit: "g" },
   { key: "fat", label: "Fat", shortLabel: "Fat", unit: "g" },
 ];
 
@@ -107,26 +136,103 @@ const DEFAULT_FORM: FoodForm = {
   protein: "",
 };
 
+function defaultMacroState(): MacroState {
+  return {
+    foods: DEFAULT_FOODS,
+    entries: [],
+  };
+}
+
+function serializeMacroState(state: MacroState) {
+  return {
+    ...state,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
 function todayIso() {
   const date = new Date();
   date.setMinutes(date.getMinutes() - date.getTimezoneOffset());
   return date.toISOString().slice(0, 10);
 }
 
-function dateOffset(isoDate: string, days: number) {
+function isoFromDate(date: Date) {
+  const localDate = new Date(date);
+  localDate.setMinutes(localDate.getMinutes() - localDate.getTimezoneOffset());
+  return localDate.toISOString().slice(0, 10);
+}
+
+function isIsoDate(value: string) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    return false;
+  }
+
+  return Number.isFinite(parseIsoDate(value).getTime());
+}
+
+function normalizeIsoDate(value: string) {
+  return isIsoDate(value) ? value : todayIso();
+}
+
+function parseIsoDate(isoDate: string) {
   const [year, month, day] = isoDate.split("-").map(Number);
-  const date = new Date(year, month - 1, day + days);
-  date.setMinutes(date.getMinutes() - date.getTimezoneOffset());
-  return date.toISOString().slice(0, 10);
+  return new Date(year, month - 1, day);
 }
 
 function readableDate(isoDate: string) {
-  const [year, month, day] = isoDate.split("-").map(Number);
   return new Intl.DateTimeFormat("en", {
     weekday: "short",
     month: "short",
     day: "numeric",
-  }).format(new Date(year, month - 1, day));
+  }).format(parseIsoDate(isoDate));
+}
+
+function monthLabel(isoDate: string) {
+  return new Intl.DateTimeFormat("en", {
+    month: "long",
+    year: "numeric",
+  }).format(parseIsoDate(isoDate));
+}
+
+function periodDates(period: PeriodKey, isoDate: string) {
+  if (period === "day") {
+    return [isoDate];
+  }
+
+  const baseDate = parseIsoDate(isoDate);
+
+  if (period === "week") {
+    const weekStart = new Date(baseDate);
+    weekStart.setDate(baseDate.getDate() - baseDate.getDay());
+    return Array.from({ length: 7 }, (_, index) => {
+      const date = new Date(weekStart);
+      date.setDate(weekStart.getDate() + index);
+      return isoFromDate(date);
+    });
+  }
+
+  const firstDay = new Date(baseDate.getFullYear(), baseDate.getMonth(), 1);
+  const lastDay = new Date(baseDate.getFullYear(), baseDate.getMonth() + 1, 0);
+  const dayCount = lastDay.getDate();
+
+  return Array.from({ length: dayCount }, (_, index) => {
+    const date = new Date(firstDay);
+    date.setDate(index + 1);
+    return isoFromDate(date);
+  });
+}
+
+function periodLabel(period: PeriodKey, isoDate: string) {
+  if (period === "day") {
+    return readableDate(isoDate);
+  }
+
+  if (period === "month") {
+    return monthLabel(isoDate);
+  }
+
+  const days = periodDates("week", isoDate);
+  return `${readableDate(days[0])} - ${readableDate(days[days.length - 1])}`;
 }
 
 function makeId(prefix: string) {
@@ -163,6 +269,26 @@ function normalizeServings(value: number) {
   return Math.max(0.25, Math.round(value * 4) / 4);
 }
 
+function macroLine(values: MacroValues) {
+  return `${cleanNumber(values.calories)} cal, ${cleanNumber(values.protein)}g protein, ${cleanNumber(values.carbs)}g carbs, ${cleanNumber(values.fat)}g fat`;
+}
+
+function makeLogEntry(food: Food, date: string): LogEntry {
+  const entryDate = normalizeIsoDate(date);
+
+  return {
+    id: makeId("entry"),
+    foodId: food.id,
+    foodName: food.name,
+    date: entryDate,
+    servings: 1,
+    calories: food.calories,
+    carbs: food.carbs,
+    fat: food.fat,
+    protein: food.protein,
+  };
+}
+
 function isFood(value: unknown): value is Food {
   if (!value || typeof value !== "object") {
     return false;
@@ -177,144 +303,319 @@ function isFood(value: unknown): value is Food {
   );
 }
 
-function isLogEntry(value: unknown): value is LogEntry {
+function normalizeLogEntry(value: unknown): LogEntry | null {
   if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const { id, foodId, foodName, date, servings, calories, carbs, fat, protein } =
+    value as Partial<LogEntry>;
+  if (
+    typeof id !== "string" ||
+    typeof foodName !== "string" ||
+    typeof date !== "string" ||
+    typeof servings !== "number" ||
+    typeof calories !== "number" ||
+    typeof carbs !== "number" ||
+    typeof fat !== "number" ||
+    typeof protein !== "number"
+  ) {
+    return null;
+  }
+
+  return {
+    id,
+    foodId:
+      typeof foodId === "string" && foodId
+        ? foodId
+        : `legacy-${foodName.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`,
+    foodName,
+    date: normalizeIsoDate(date),
+    servings: normalizeServings(servings),
+    calories,
+    carbs,
+    fat,
+    protein,
+  };
+}
+
+function firebaseListValues(value: unknown) {
+  if (Array.isArray(value)) {
+    return value.filter(Boolean);
+  }
+
+  if (value && typeof value === "object") {
+    return Object.values(value);
+  }
+
+  return null;
+}
+
+function normalizeMacroState(value: unknown): RemoteMacroState | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const state = value as Partial<Record<keyof MacroState, unknown>>;
+  const foodValues = firebaseListValues(state.foods);
+  const entryValues = firebaseListValues(state.entries);
+  const foods = foodValues?.filter(isFood) ?? [];
+  const entries = entryValues?.map(normalizeLogEntry).filter((entry) => entry !== null) ?? [];
+
+  const hasCleanShape =
+    Array.isArray(state.foods) &&
+    Array.isArray(state.entries) &&
+    foodValues?.length === foods.length &&
+    entryValues?.length === entries.length &&
+    foods.length > 0;
+
+  return {
+    needsRepair: !hasCleanShape,
+    state: {
+      foods: foods.length > 0 ? foods : DEFAULT_FOODS,
+      entries,
+    },
+  };
+}
+
+function userMacroStatePath(uid: string) {
+  return `users/${uid}/macroState`;
+}
+
+function shouldUseRedirectSignIn() {
+  if (typeof window === "undefined") {
     return false;
   }
 
-  const entry = value as Partial<LogEntry>;
   return (
-    typeof entry.id === "string" &&
-    typeof entry.foodName === "string" &&
-    typeof entry.date === "string" &&
-    typeof entry.servings === "number" &&
-    MACRO_FIELDS.every(({ key }) => typeof entry[key] === "number")
+    window.matchMedia("(display-mode: standalone)").matches ||
+    /Android|iPhone|iPad|iPod/i.test(window.navigator.userAgent)
   );
 }
 
-function totalRemaining(total: number, target: number) {
-  return Math.max(target - total, 0);
+function shouldRetryWithRedirect(error: unknown) {
+  if (!error || typeof error !== "object" || !("code" in error)) {
+    return false;
+  }
+
+  const code = String((error as { code?: unknown }).code);
+  return (
+    code === "auth/popup-blocked" ||
+    code === "auth/cancelled-popup-request" ||
+    code === "auth/operation-not-supported-in-this-environment"
+  );
+}
+
+function userInitials(user: User) {
+  const name = user.displayName ?? user.email ?? "Signed in";
+  const parts = name.split(/[\s@._-]+/).filter(Boolean);
+  return (
+    parts
+      .slice(0, 2)
+      .map((part) => part[0]?.toUpperCase())
+      .join("") || "A"
+  );
 }
 
 export default function Home() {
-  const [foods, setFoods] = useState<Food[]>(DEFAULT_FOODS);
+  const [foods, setFoods] = useState<Food[]>([]);
   const [entries, setEntries] = useState<LogEntry[]>([]);
-  const [targets, setTargets] = useState<MacroValues>(EMPTY_MACROS);
-  const [selectedDate, setSelectedDate] = useState(todayIso);
-  const [activeTab, setActiveTab] = useState<TabKey>("today");
+  const [activeTab, setActiveTab] = useState<TabKey>("add");
+  const [period, setPeriod] = useState<PeriodKey>("day");
+  const [statsDate, setStatsDate] = useState("");
+  const [addDate, setAddDate] = useState("");
   const [foodForm, setFoodForm] = useState<FoodForm>({ ...DEFAULT_FORM });
-  const [quickQuery, setQuickQuery] = useState("");
-  const [libraryQuery, setLibraryQuery] = useState("");
+  const [foodQuery, setFoodQuery] = useState("");
   const [formError, setFormError] = useState("");
   const [notice, setNotice] = useState<Notice | null>(null);
-  const [hasHydrated, setHasHydrated] = useState(false);
+  const [datesReady, setDatesReady] = useState(false);
+  const [user, setUser] = useState<User | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [authAction, setAuthAction] = useState(false);
+  const [remoteReady, setRemoteReady] = useState(false);
+  const [syncState, setSyncState] = useState<SyncState>("checking");
+  const [syncError, setSyncError] = useState("");
 
   useEffect(() => {
-    let isActive = true;
+    void initializeFirebaseAnalytics();
 
     window.queueMicrotask(() => {
-      if (!isActive) {
-        return;
-      }
-
-      const savedState = window.localStorage.getItem(STORAGE_KEY);
-
-      if (savedState) {
-        try {
-          const parsed = JSON.parse(savedState) as {
-            foods?: unknown;
-            entries?: unknown;
-            targets?: unknown;
-          };
-
-          if (Array.isArray(parsed.foods) && parsed.foods.every(isFood)) {
-            setFoods(parsed.foods.length > 0 ? parsed.foods : DEFAULT_FOODS);
-          }
-
-          if (Array.isArray(parsed.entries) && parsed.entries.every(isLogEntry)) {
-            setEntries(parsed.entries);
-          }
-
-          if (
-            parsed.targets &&
-            typeof parsed.targets === "object" &&
-            MACRO_FIELDS.every(
-              ({ key }) =>
-                typeof (parsed.targets as Partial<MacroValues>)[key] === "number",
-            )
-          ) {
-            setTargets(parsed.targets as MacroValues);
-          }
-        } catch {
-          window.localStorage.removeItem(STORAGE_KEY);
-        }
-      }
-
-      setHasHydrated(true);
+      const initialDate = todayIso();
+      setStatsDate(initialDate);
+      setAddDate(initialDate);
+      setDatesReady(true);
     });
 
-    return () => {
-      isActive = false;
-    };
+    const unsubscribe = onAuthStateChanged(firebaseAuth, (currentUser) => {
+      setUser(currentUser);
+      setAuthReady(true);
+      setRemoteReady(false);
+      setSyncError("");
+      setSyncState(currentUser ? "loading" : "signedOut");
+
+      if (!currentUser) {
+        setFoods([]);
+        setEntries([]);
+      }
+    });
+
+    void getRedirectResult(firebaseAuth).catch(() => {
+      setNotice({
+        message: "Google sign-in could not finish. Try again.",
+        tone: "error",
+      });
+    });
+
+    return unsubscribe;
   }, []);
 
   useEffect(() => {
-    if (!hasHydrated) {
+    if (!user) {
       return;
     }
 
-    window.localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify({ foods, entries, targets }),
+    const userStateRef = ref(firebaseDatabase, userMacroStatePath(user.uid));
+    return onValue(
+      userStateRef,
+      (snapshot) => {
+        if (!snapshot.exists()) {
+          const initialState = defaultMacroState();
+          setFoods(initialState.foods);
+          setEntries(initialState.entries);
+          setSyncState("saving");
+          void set(userStateRef, serializeMacroState(initialState))
+            .then(() => {
+              setSyncError("");
+              setRemoteReady(true);
+              setSyncState("saved");
+            })
+            .catch((error: unknown) => {
+              setRemoteReady(false);
+              setSyncError(error instanceof Error ? error.message : "Save failed.");
+              setSyncState("error");
+              setNotice({
+                message: "Could not create your account data.",
+                tone: "error",
+              });
+            });
+          return;
+        }
+
+        const remoteMacroState = normalizeMacroState(snapshot.val());
+        if (!remoteMacroState) {
+          setRemoteReady(false);
+          setSyncError("Your account data could not be read.");
+          setSyncState("error");
+          setNotice({
+            message: "Could not load your saved account data.",
+            tone: "error",
+          });
+          return;
+        }
+
+        setFoods(remoteMacroState.state.foods);
+        setEntries(remoteMacroState.state.entries);
+        setSyncError("");
+
+        if (remoteMacroState.needsRepair) {
+          setRemoteReady(false);
+          setSyncState("saving");
+          void set(userStateRef, serializeMacroState(remoteMacroState.state))
+            .then(() => {
+              setRemoteReady(true);
+              setSyncState("saved");
+            })
+            .catch((error: unknown) => {
+              setRemoteReady(false);
+              setSyncError(error instanceof Error ? error.message : "Save failed.");
+              setSyncState("error");
+              setNotice({
+                message: "Could not repair your account data.",
+                tone: "error",
+              });
+            });
+          return;
+        }
+
+        setRemoteReady(true);
+        setSyncState("saved");
+      },
+      (error) => {
+        setRemoteReady(false);
+        setSyncError(error.message);
+        setSyncState("error");
+        setNotice({
+          message: "Could not load your saved account data.",
+          tone: "error",
+        });
+      },
     );
-  }, [entries, foods, hasHydrated, targets]);
+  }, [user]);
 
   useEffect(() => {
     if (!notice) {
       return;
     }
 
-    const timer = window.setTimeout(() => setNotice(null), 3800);
+    const timer = window.setTimeout(() => setNotice(null), 2800);
     return () => window.clearTimeout(timer);
   }, [notice]);
 
-  const dailyEntries = useMemo(
-    () => entries.filter((entry) => entry.date === selectedDate),
-    [entries, selectedDate],
+  const addDateEntries = useMemo(
+    () => entries.filter((entry) => entry.date === addDate),
+    [entries, addDate],
   );
 
-  const dailyTotals = useMemo(() => macroTotal(dailyEntries), [dailyEntries]);
-
-  const weekDays = useMemo(
-    () => Array.from({ length: 7 }, (_, index) => dateOffset(selectedDate, index - 6)),
-    [selectedDate],
+  const periodDateList = useMemo(
+    () => periodDates(period, statsDate),
+    [period, statsDate],
   );
 
-  const weeklyRows = useMemo(
+  const periodDateSet = useMemo(() => new Set(periodDateList), [periodDateList]);
+
+  const periodEntries = useMemo(
+    () => entries.filter((entry) => periodDateSet.has(entry.date)),
+    [entries, periodDateSet],
+  );
+
+  const periodTotals = useMemo(() => macroTotal(periodEntries), [periodEntries]);
+
+  const dailyBreakdown = useMemo(
     () =>
-      weekDays.map((date) => {
+      periodDateList.map((date) => {
         const dayEntries = entries.filter((entry) => entry.date === date);
         return {
           date,
+          entryCount: dayEntries.length,
           totals: macroTotal(dayEntries),
         };
       }),
-    [entries, weekDays],
+    [entries, periodDateList],
   );
 
-  const weeklyTotals = useMemo(
-    () =>
-      weeklyRows.reduce<MacroValues>(
-        (total, row) => ({
-          calories: total.calories + row.totals.calories,
-          carbs: total.carbs + row.totals.carbs,
-          fat: total.fat + row.totals.fat,
-          protein: total.protein + row.totals.protein,
-        }),
-        { ...EMPTY_MACROS },
-      ),
-    [weeklyRows],
-  );
+  const topFoods = useMemo(() => {
+    const foodTotals = new Map<string, MacroValues & { servings: number }>();
+
+    periodEntries.forEach((entry) => {
+      const current = foodTotals.get(entry.foodName) ?? {
+        ...EMPTY_MACROS,
+        servings: 0,
+      };
+
+      foodTotals.set(entry.foodName, {
+        calories: current.calories + entry.calories * entry.servings,
+        carbs: current.carbs + entry.carbs * entry.servings,
+        fat: current.fat + entry.fat * entry.servings,
+        protein: current.protein + entry.protein * entry.servings,
+        servings: current.servings + entry.servings,
+      });
+    });
+
+    return Array.from(foodTotals.entries())
+      .map(([name, totals]) => ({ name, ...totals }))
+      .sort((first, second) => second.calories - first.calories)
+      .slice(0, 5);
+  }, [periodEntries]);
 
   const foodRankById = useMemo(() => {
     const ranks = new Map<string, number>();
@@ -326,8 +627,8 @@ export default function Home() {
     return ranks;
   }, [entries]);
 
-  const quickFoods = useMemo(() => {
-    const query = quickQuery.trim().toLowerCase();
+  const savedFoodOptions = useMemo(() => {
+    const query = foodQuery.trim().toLowerCase();
     const rankedFoods = [...foods].sort((first, second) => {
       const firstRank = foodRankById.get(first.id) ?? Number.MAX_SAFE_INTEGER;
       const secondRank = foodRankById.get(second.id) ?? Number.MAX_SAFE_INTEGER;
@@ -344,51 +645,137 @@ export default function Home() {
     }
 
     return rankedFoods.filter((food) => food.name.toLowerCase().includes(query));
-  }, [foodRankById, foods, quickQuery]);
+  }, [foodQuery, foodRankById, foods]);
 
-  const libraryFoods = useMemo(() => {
-    const query = libraryQuery.trim().toLowerCase();
-    const sortedFoods = [...foods].sort((first, second) =>
-      first.name.localeCompare(second.name),
-    );
+  const addDateEntryCountLabel =
+    addDateEntries.length === 1
+      ? "1 item logged"
+      : `${addDateEntries.length} items logged`;
 
-    if (!query) {
-      return sortedFoods;
+  const periodEntryCountLabel =
+    periodEntries.length === 1
+      ? "1 item"
+      : `${periodEntries.length} items`;
+
+  const visibleDailyBreakdown =
+    period === "month"
+      ? dailyBreakdown.filter((row) => row.entryCount > 0)
+      : dailyBreakdown;
+
+  const syncStatusLabel = useMemo(() => {
+    if (!authReady || syncState === "checking") {
+      return "Opening";
     }
 
-    return sortedFoods.filter((food) => food.name.toLowerCase().includes(query));
-  }, [libraryQuery, foods]);
+    if (!user) {
+      return "Sign in required";
+    }
 
-  const dailyEntryCountLabel =
-    dailyEntries.length === 1 ? "1 food logged" : `${dailyEntries.length} foods logged`;
-  const calorieTarget = targets.calories;
-  const calorieProgress =
-    calorieTarget > 0 ? Math.min((dailyTotals.calories / calorieTarget) * 100, 100) : 0;
+    if (syncState === "loading") {
+      return "Loading";
+    }
+
+    if (syncState === "saving") {
+      return "Saving";
+    }
+
+    if (syncState === "error") {
+      return "Needs attention";
+    }
+
+    return "Saved";
+  }, [authReady, syncState, user]);
+
+  const accountName = user?.displayName ?? user?.email ?? "Account required";
 
   function showNotice(message: string, tone: NoticeTone = "success") {
     setNotice({ message, tone });
   }
 
-  function addEntry(food: Food, servings = 1, message?: string) {
-    setEntries((currentEntries) => [
-      {
-        id: makeId("entry"),
-        foodId: food.id,
-        foodName: food.name,
-        date: selectedDate,
-        servings,
-        calories: food.calories,
-        carbs: food.carbs,
-        fat: food.fat,
-        protein: food.protein,
-      },
-      ...currentEntries,
-    ]);
-    showNotice(message ?? `${food.name} added to ${readableDate(selectedDate)}.`);
-    setActiveTab("today");
+  function saveMacroState(nextState: MacroState, successMessage?: string) {
+    if (!user || !remoteReady) {
+      showNotice("Sign in to save changes.", "error");
+      return;
+    }
+
+    setFoods(nextState.foods);
+    setEntries(nextState.entries);
+    setSyncState("saving");
+    setSyncError("");
+
+    void set(
+      ref(firebaseDatabase, userMacroStatePath(user.uid)),
+      serializeMacroState(nextState),
+    )
+      .then(() => {
+        setSyncError("");
+        setSyncState("saved");
+
+        if (successMessage) {
+          showNotice(successMessage);
+        }
+      })
+      .catch((error: unknown) => {
+        setSyncError(error instanceof Error ? error.message : "Save failed.");
+        setSyncState("error");
+        setNotice({
+          message: "Could not save your latest changes.",
+          tone: "error",
+        });
+      });
   }
 
-  function createFood(logImmediately: boolean) {
+  async function signInWithGoogle() {
+    setAuthAction(true);
+
+    try {
+      if (shouldUseRedirectSignIn()) {
+        await signInWithRedirect(firebaseAuth, googleAuthProvider);
+        return;
+      }
+
+      await signInWithPopup(firebaseAuth, googleAuthProvider);
+    } catch (error) {
+      if (shouldRetryWithRedirect(error)) {
+        await signInWithRedirect(firebaseAuth, googleAuthProvider);
+        return;
+      }
+
+      showNotice("Google sign-in could not start.", "error");
+    } finally {
+      setAuthAction(false);
+    }
+  }
+
+  async function handleSignOut() {
+    setAuthAction(true);
+
+    try {
+      await signOut(firebaseAuth);
+      showNotice("Signed out.");
+    } catch {
+      showNotice("Could not sign out.", "error");
+    } finally {
+      setAuthAction(false);
+    }
+  }
+
+  function logFood(food: Food, date = addDate, message?: string) {
+    const entry = makeLogEntry(food, date);
+    const entryDate = entry.date;
+    const nextState = {
+      foods,
+      entries: [entry, ...entries],
+    };
+
+    setStatsDate(entryDate);
+    saveMacroState(
+      nextState,
+      message ?? `${food.name} added to ${readableDate(entryDate)}.`,
+    );
+  }
+
+  function createFood(logAfterSave: boolean) {
     setFormError("");
     const name = foodForm.name.trim();
 
@@ -413,17 +800,22 @@ export default function Home() {
       (food) => food.name.trim().toLowerCase() === name.toLowerCase(),
     );
 
-    if (existingFood && logImmediately) {
-      setFoodForm({ ...DEFAULT_FORM });
-      setQuickQuery("");
-      setLibraryQuery("");
-      setFormError("");
-      addEntry(existingFood, 1, `${existingFood.name} was already saved, so I logged it.`);
-      setActiveTab("today");
-      return;
-    }
-
     if (existingFood) {
+      if (logAfterSave) {
+        const entry = makeLogEntry(existingFood, addDate);
+        setFoodForm({ ...DEFAULT_FORM });
+        setFoodQuery("");
+        setStatsDate(entry.date);
+        saveMacroState(
+          {
+            foods,
+            entries: [entry, ...entries],
+          },
+          `${existingFood.name} was already saved, so it was added to ${readableDate(addDate)}.`,
+        );
+        return;
+      }
+
       setFormError("That food is already saved.");
       showNotice("That food is already saved.", "error");
       return;
@@ -439,63 +831,38 @@ export default function Home() {
       createdAt: new Date().toISOString(),
     };
 
-    setFoods((currentFoods) => [food, ...currentFoods]);
+    const nextFoods = [food, ...foods];
+    const newEntry = logAfterSave ? makeLogEntry(food, addDate) : null;
+    const nextEntries = newEntry ? [newEntry, ...entries] : entries;
+
     setFoodForm({ ...DEFAULT_FORM });
-    setQuickQuery("");
-    setLibraryQuery("");
+    setFoodQuery("");
     setFormError("");
 
-    if (logImmediately) {
-      addEntry(food, 1, `${food.name} saved and logged for ${readableDate(selectedDate)}.`);
-      setActiveTab("today");
+    if (newEntry) {
+      setStatsDate(newEntry.date);
+      saveMacroState(
+        {
+          foods: nextFoods,
+          entries: nextEntries,
+        },
+        `${food.name} saved and added to ${readableDate(addDate)}.`,
+      );
       return;
     }
 
-    showNotice(`${food.name} saved.`);
+    saveMacroState(
+      {
+        foods: nextFoods,
+        entries: nextEntries,
+      },
+      `${food.name} saved.`,
+    );
   }
 
   function handleFoodSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    createFood(false);
-  }
-
-  function updateEntryServings(entryId: string, nextValue: number) {
-    setEntries((currentEntries) =>
-      currentEntries.map((entry) =>
-        entry.id === entryId
-          ? { ...entry, servings: normalizeServings(nextValue) }
-          : entry,
-      ),
-    );
-  }
-
-  function removeEntry(entryId: string) {
-    setEntries((currentEntries) =>
-      currentEntries.filter((entry) => entry.id !== entryId),
-    );
-    showNotice("Food removed from the day.");
-  }
-
-  function removeFood(foodId: string) {
-    const food = foods.find((item) => item.id === foodId);
-    setFoods((currentFoods) => currentFoods.filter((item) => item.id !== foodId));
-    showNotice(food ? `${food.name} deleted.` : "Food deleted.");
-  }
-
-  function clearDay() {
-    if (dailyEntries.length === 0) {
-      return;
-    }
-
-    const shouldClear = window.confirm(`Clear all foods for ${readableDate(selectedDate)}?`);
-    if (!shouldClear) {
-      return;
-    }
-
-    setEntries((currentEntries) =>
-      currentEntries.filter((entry) => entry.date !== selectedDate),
-    );
-    showNotice(`${readableDate(selectedDate)} cleared.`);
+    createFood(true);
   }
 
   function updateFoodForm(key: keyof FoodForm, value: string) {
@@ -505,16 +872,123 @@ export default function Home() {
     }));
   }
 
-  function updateTarget(key: MacroKey, value: string) {
-    setTargets((currentTargets) => ({
-      ...currentTargets,
-      [key]: parseMacroInput(value) ?? 0,
-    }));
+  function updateEntryServings(entryId: string, nextValue: number) {
+    saveMacroState({
+      foods,
+      entries: entries.map((entry) =>
+        entry.id === entryId
+          ? { ...entry, servings: normalizeServings(nextValue) }
+          : entry,
+      ),
+    });
   }
 
-  function handleTargetsSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    showNotice("Targets saved.");
+  function removeEntry(entryId: string) {
+    saveMacroState(
+      {
+        foods,
+        entries: entries.filter((entry) => entry.id !== entryId),
+      },
+      "Item removed.",
+    );
+  }
+
+  function clearStatsDay() {
+    if (period !== "day" || periodEntries.length === 0) {
+      return;
+    }
+
+    const shouldClear = window.confirm(`Clear all items for ${readableDate(statsDate)}?`);
+    if (!shouldClear) {
+      return;
+    }
+
+    saveMacroState(
+      {
+        foods,
+        entries: entries.filter((entry) => entry.date !== statsDate),
+      },
+      `${readableDate(statsDate)} cleared.`,
+    );
+  }
+
+  if (!datesReady || !authReady || !user || !remoteReady || syncState === "error") {
+    const gateTitle = !datesReady || !authReady
+      ? "Checking sign-in"
+      : !user
+        ? "Sign in to continue"
+        : syncState === "error"
+          ? "Account data needs attention"
+          : "Loading your macro counter";
+    const gateCopy = !datesReady || !authReady
+      ? "One moment while your account status is checked."
+      : !user
+        ? "Use Google to open your food list, logs, and stats."
+        : syncState === "error"
+          ? "Try reloading, or sign out and sign in again."
+          : "Your food list, logs, and stats are opening now.";
+
+    return (
+      <main className="app-shell auth-shell">
+        <section className="auth-gate" aria-labelledby="auth-title">
+          <div className="brand-lockup">
+            <div className="brand-mark" aria-hidden="true">
+              AM
+            </div>
+            <div>
+              <p className="kicker">Personal macro tracker</p>
+              <h1>Andy&apos;s Macro Counter</h1>
+            </div>
+          </div>
+
+          <div className="auth-copy">
+            <p className="eyebrow">{syncStatusLabel}</p>
+            <h2 id="auth-title">{gateTitle}</h2>
+            <p className="support-text">{gateCopy}</p>
+            {syncError && <p className="error-detail">{syncError}</p>}
+          </div>
+
+          {!user ? (
+            <button
+              className="primary-button auth-button"
+              type="button"
+              disabled={!authReady || authAction}
+              onClick={signInWithGoogle}
+            >
+              Sign in with Google
+            </button>
+          ) : (
+            <div className="auth-actions">
+              <button
+                className="primary-button auth-button"
+                type="button"
+                onClick={() => window.location.reload()}
+              >
+                Try again
+              </button>
+              <button
+                className="secondary-button auth-button"
+                type="button"
+                disabled={authAction}
+                onClick={handleSignOut}
+              >
+                Sign out
+              </button>
+            </div>
+          )}
+        </section>
+
+        <div
+          className={`status-toast${notice ? " visible" : ""}${
+            notice?.tone === "error" ? " error" : ""
+          }`}
+          role="status"
+          aria-live="polite"
+        >
+          {notice?.message}
+        </div>
+      </main>
+    );
   }
 
   return (
@@ -525,33 +999,31 @@ export default function Home() {
             AM
           </div>
           <div>
-            <p className="kicker">Fast macro logging</p>
+            <p className="kicker">Personal macro tracker</p>
             <h1>Andy&apos;s Macro Counter</h1>
           </div>
         </div>
 
-        <div className="date-actions">
-          <label className="date-picker" htmlFor="selected-date">
-            <span>Day</span>
-            <input
-              id="selected-date"
-              type="date"
-              value={selectedDate}
-              onChange={(event) => setSelectedDate(event.target.value)}
-            />
-          </label>
+        <div className="account-panel" title={syncError || syncStatusLabel}>
+          <div className="account-avatar" aria-hidden="true">
+            {userInitials(user)}
+          </div>
+          <div className="account-copy">
+            <span>{syncStatusLabel}</span>
+            <strong>{accountName}</strong>
+          </div>
           <button
-            className="ghost-button today-button"
+            className="secondary-button account-button"
             type="button"
-            disabled={selectedDate === todayIso()}
-            onClick={() => setSelectedDate(todayIso())}
+            disabled={authAction}
+            onClick={handleSignOut}
           >
-            Today
+            Sign out
           </button>
         </div>
       </header>
 
-      <nav className="tab-bar" aria-label="Macro counter sections">
+      <nav className="tab-bar" aria-label="Macro counter tabs">
         {TABS.map((tab) => (
           <button
             aria-current={activeTab === tab.key ? "page" : undefined}
@@ -560,8 +1032,7 @@ export default function Home() {
             type="button"
             onClick={() => setActiveTab(tab.key)}
           >
-            <span>{tab.label}</span>
-            <small>{tab.summary}</small>
+            {tab.label}
           </button>
         ))}
       </nav>
@@ -576,157 +1047,269 @@ export default function Home() {
         {notice?.message}
       </div>
 
-      {activeTab === "today" && (
-        <section className="tab-panel today-panel" aria-labelledby="today-title">
-          <section className="today-hero" aria-labelledby="today-title">
-            <div className="hero-copy">
-              <p className="eyebrow">Today</p>
-              <h2 id="today-title">{readableDate(selectedDate)}</h2>
-              <span className="logged-badge">{dailyEntryCountLabel}</span>
+      {activeTab === "add" && (
+        <section className="tab-panel" aria-labelledby="add-title">
+          <section className="page-topper add-topper">
+            <div>
+              <p className="eyebrow">Log food</p>
+              <h2 id="add-title">Add Item</h2>
+              <p className="support-text">
+                Pick a saved food, or create it once and use it every day.
+              </p>
             </div>
 
-            <div className="calorie-focus">
-              <span>Calories</span>
-              <strong>{cleanNumber(dailyTotals.calories)}</strong>
-              <small>
-                {calorieTarget > 0
-                  ? `${cleanNumber(totalRemaining(dailyTotals.calories, calorieTarget))} left`
-                  : "No target set"}
-              </small>
-              <div className="progress-track" aria-hidden="true">
-                <div style={{ width: `${calorieProgress}%` }} />
-              </div>
+            <div className="date-card">
+              <label className="date-picker" htmlFor="add-date">
+                <span>Date</span>
+                <input
+                  id="add-date"
+                  type="date"
+                  value={addDate}
+                  onChange={(event) => setAddDate(normalizeIsoDate(event.target.value))}
+                />
+              </label>
+              <button
+                className="secondary-button"
+                type="button"
+                disabled={addDate === todayIso()}
+                onClick={() => setAddDate(todayIso())}
+              >
+                Today
+              </button>
+              <span className="count-badge">{addDateEntryCountLabel}</span>
             </div>
-
-            <button
-              className="ghost-button"
-              type="button"
-              onClick={clearDay}
-              disabled={dailyEntries.length === 0}
-            >
-              Clear Day
-            </button>
           </section>
 
-          <section className="macro-snapshot" aria-label="Daily macro totals">
-            {MACRO_FIELDS.filter((field) => field.key !== "calories").map((field) => {
-              const target = targets[field.key];
-              const total = dailyTotals[field.key];
-              const progress = target > 0 ? Math.min((total / target) * 100, 100) : 0;
-
-              return (
-                <article className={`macro-stat macro-${field.key}`} key={field.key}>
-                  <div>
-                    <span>{field.label}</span>
-                    <strong>
-                      {cleanNumber(total)}
-                      {field.unit}
-                    </strong>
-                  </div>
-                  <small>
-                    {target > 0
-                      ? `${cleanNumber(totalRemaining(total, target))}${field.unit} left`
-                      : "No target"}
-                  </small>
-                  <div className="progress-track" aria-hidden="true">
-                    <div style={{ width: `${progress}%` }} />
-                  </div>
-                </article>
-              );
-            })}
-          </section>
-
-          <div className="today-grid">
-            <section className="panel quick-add-panel" aria-labelledby="quick-add-title">
-              <div className="panel-heading">
+          <section className="add-layout">
+            <div className="flow-section saved-foods-section">
+              <div className="section-heading">
                 <div>
-                  <p className="eyebrow">One tap</p>
-                  <h2 id="quick-add-title">Quick Add</h2>
+                  <p className="eyebrow">Saved foods</p>
+                  <h3>Tap Add and move on</h3>
                 </div>
-
-                <label className="search-field" htmlFor="quick-food-search">
+                <label className="search-field" htmlFor="food-search">
                   <span>Search</span>
                   <input
-                    id="quick-food-search"
+                    id="food-search"
                     type="search"
-                    value={quickQuery}
-                    placeholder="Search foods"
-                    onChange={(event) => setQuickQuery(event.target.value)}
+                    value={foodQuery}
+                    placeholder="Siggis, eggs, rice..."
+                    onChange={(event) => setFoodQuery(event.target.value)}
                   />
                 </label>
               </div>
 
-              <div className="quick-food-grid">
-                {quickFoods.length === 0 ? (
-                  <div className="empty-state action-empty">
-                    <span>No saved foods match that search.</span>
-                    <button
-                      className="secondary-button"
-                      type="button"
-                      onClick={() => {
-                        setActiveTab("foods");
-                        setQuickQuery("");
-                      }}
+              {savedFoodOptions.length > 0 ? (
+                <div className="food-option-list">
+                  {savedFoodOptions.map((food, index) => (
+                    <article
+                      className={`food-option food-tone-${index % 4}`}
+                      key={food.id}
                     >
-                      New Food
-                    </button>
-                  </div>
-                ) : (
-                  quickFoods.map((food, index) => (
-                    <article className={`quick-card food-tone-${index % 4}`} key={food.id}>
-                      <div>
+                      <div className="food-option-copy">
                         <strong>{food.name}</strong>
-                        <span>
-                          {cleanNumber(food.calories)} cal | {cleanNumber(food.protein)}g
-                          pro
-                        </span>
+                        <span>{macroLine(food)}</span>
                       </div>
                       <button
-                        className="log-button"
+                        className="primary-button"
                         type="button"
-                        aria-label={`Log ${food.name}`}
-                        onClick={() => addEntry(food)}
+                        onClick={() => logFood(food)}
                       >
-                        Log
+                        Add
                       </button>
                     </article>
-                  ))
-                )}
-              </div>
-            </section>
-
-            <section className="panel day-log" aria-labelledby="day-log-title">
-              <div className="panel-heading compact">
-                <div>
-                  <p className="eyebrow">Logged</p>
-                  <h2 id="day-log-title">Today&apos;s Foods</h2>
+                  ))}
                 </div>
+              ) : (
+                <div className="empty-state">
+                  <strong>No saved food found.</strong>
+                  <span>Create it below once, then it will show up here.</span>
+                </div>
+              )}
+            </div>
+
+            <aside className="side-stack" aria-label="Add item tools">
+              <form className="flow-section food-form" onSubmit={handleFoodSubmit}>
+                <div className="section-heading compact">
+                  <div>
+                    <p className="eyebrow">New food</p>
+                    <h3>Save once</h3>
+                  </div>
+                </div>
+
+                <label className="field" htmlFor="food-name">
+                  <span>Food name</span>
+                  <input
+                    id="food-name"
+                    value={foodForm.name}
+                    placeholder="Siggis Yogurt"
+                    onChange={(event) => updateFoodForm("name", event.target.value)}
+                  />
+                </label>
+
+                <div className="macro-input-grid">
+                  {MACRO_FIELDS.map((field) => (
+                    <label className="field" htmlFor={`food-${field.key}`} key={field.key}>
+                      <span>{field.label}</span>
+                      <input
+                        id={`food-${field.key}`}
+                        inputMode="decimal"
+                        min="0"
+                        step="0.1"
+                        type="number"
+                        value={foodForm[field.key]}
+                        placeholder="0"
+                        onChange={(event) =>
+                          updateFoodForm(field.key, event.target.value)
+                        }
+                      />
+                    </label>
+                  ))}
+                </div>
+
+                {formError && <p className="form-error">{formError}</p>}
+
+                <div className="button-row">
+                  <button className="primary-button" type="submit">
+                    Save + Add
+                  </button>
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    onClick={() => createFood(false)}
+                  >
+                    Save Only
+                  </button>
+                </div>
+              </form>
+
+              <section className="flow-section compact-list" aria-labelledby="logged-title">
+                <div className="section-heading compact">
+                  <div>
+                    <p className="eyebrow">{readableDate(addDate)}</p>
+                    <h3 id="logged-title">Added to This Date</h3>
+                  </div>
+                </div>
+
+                {addDateEntries.length > 0 ? (
+                  <div className="mini-entry-list">
+                    {addDateEntries.slice(0, 5).map((entry) => (
+                      <div className="mini-entry-row" key={entry.id}>
+                        <div>
+                          <strong>{entry.foodName}</strong>
+                          <span>
+                            {cleanNumber(entry.calories * entry.servings)} cal
+                          </span>
+                        </div>
+                        <button
+                          className="text-button danger"
+                          type="button"
+                          onClick={() => removeEntry(entry.id)}
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="empty-state small">
+                    <strong>Nothing logged yet.</strong>
+                    <span>Add from saved foods to start the day.</span>
+                  </div>
+                )}
+              </section>
+            </aside>
+          </section>
+        </section>
+      )}
+
+      {activeTab === "stats" && (
+        <section className="tab-panel" aria-labelledby="stats-title">
+          <section className="page-topper stats-topper">
+            <div>
+              <p className="eyebrow">Review</p>
+              <h2 id="stats-title">Stats</h2>
+              <p className="support-text">
+                {periodLabel(period, statsDate)} - {periodEntryCountLabel} logged.
+              </p>
+            </div>
+
+            <div className="stats-controls">
+              <div className="period-control" aria-label="Stats period">
+                {PERIODS.map((item) => (
+                  <button
+                    aria-pressed={period === item.key}
+                    key={item.key}
+                    type="button"
+                    onClick={() => setPeriod(item.key)}
+                  >
+                    {item.label}
+                  </button>
+                ))}
               </div>
 
-              <div className="entry-list">
-                {dailyEntries.length === 0 ? (
-                  <p className="empty-state">Nothing logged for this day yet.</p>
-                ) : (
-                  dailyEntries.map((entry) => (
+              <label className="date-picker" htmlFor="stats-date">
+                <span>Date</span>
+                <input
+                  id="stats-date"
+                  type="date"
+                  value={statsDate}
+                  onChange={(event) => setStatsDate(normalizeIsoDate(event.target.value))}
+                />
+              </label>
+            </div>
+          </section>
+
+          <section className="macro-snapshot" aria-label="Macro totals">
+            {MACRO_FIELDS.map((field) => (
+              <article className={`macro-tile macro-${field.key}`} key={field.key}>
+                <span>{field.label}</span>
+                <strong>
+                  {cleanNumber(periodTotals[field.key])}
+                  {field.unit && <small>{field.unit}</small>}
+                </strong>
+              </article>
+            ))}
+          </section>
+
+          {period === "day" ? (
+            <section className="flow-section" aria-labelledby="day-foods-title">
+              <div className="section-heading">
+                <div>
+                  <p className="eyebrow">{readableDate(statsDate)}</p>
+                  <h3 id="day-foods-title">Logged Items</h3>
+                </div>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  disabled={periodEntries.length === 0}
+                  onClick={clearStatsDay}
+                >
+                  Clear Day
+                </button>
+              </div>
+
+              {periodEntries.length > 0 ? (
+                <div className="entry-list">
+                  {periodEntries.map((entry) => (
                     <article className="entry-row" key={entry.id}>
                       <div className="entry-food">
                         <strong>{entry.foodName}</strong>
-                        <span>{cleanNumber(entry.calories)} cal per serving</span>
+                        <span>{macroLine(entry)}</span>
                       </div>
 
-                      <div
-                        className="serving-control"
-                        aria-label={`${entry.foodName} servings`}
-                      >
+                      <div className="serving-control" aria-label={`${entry.foodName} servings`}>
                         <button
                           type="button"
-                          aria-label={`Decrease servings for ${entry.foodName}`}
-                          onClick={() => updateEntryServings(entry.id, entry.servings - 0.25)}
+                          onClick={() =>
+                            updateEntryServings(entry.id, entry.servings - 0.25)
+                          }
                         >
                           -
                         </button>
                         <input
-                          aria-label={`Servings for ${entry.foodName}`}
+                          aria-label="Servings"
+                          inputMode="decimal"
                           min="0.25"
                           step="0.25"
                           type="number"
@@ -737,14 +1320,15 @@ export default function Home() {
                         />
                         <button
                           type="button"
-                          aria-label={`Increase servings for ${entry.foodName}`}
-                          onClick={() => updateEntryServings(entry.id, entry.servings + 0.25)}
+                          onClick={() =>
+                            updateEntryServings(entry.id, entry.servings + 0.25)
+                          }
                         >
                           +
                         </button>
                       </div>
 
-                      <dl className="macro-pills">
+                      <dl className="entry-macros">
                         {MACRO_FIELDS.map((field) => (
                           <div className={`macro-pill macro-${field.key}`} key={field.key}>
                             <dt>{field.shortLabel}</dt>
@@ -757,238 +1341,95 @@ export default function Home() {
                       </dl>
 
                       <button
-                        className="icon-button"
+                        className="text-button danger"
                         type="button"
-                        aria-label={`Remove ${entry.foodName}`}
-                        title={`Remove ${entry.foodName}`}
                         onClick={() => removeEntry(entry.id)}
                       >
-                        x
+                        Remove
                       </button>
                     </article>
-                  ))
-                )}
-              </div>
-            </section>
-          </div>
-        </section>
-      )}
-
-      {activeTab === "foods" && (
-        <section className="tab-panel" aria-labelledby="foods-title">
-          <div className="section-intro">
-            <div>
-              <p className="eyebrow">Reusable foods</p>
-              <h2 id="foods-title">Food Library</h2>
-            </div>
-          </div>
-
-          <div className="library-grid">
-            <section className="panel" aria-labelledby="new-food-title">
-              <div className="panel-heading compact">
-                <div>
-                  <p className="eyebrow">Create once</p>
-                  <h2 id="new-food-title">New Food</h2>
-                </div>
-              </div>
-
-              <form className="food-form" onSubmit={handleFoodSubmit}>
-                <label className="field full-width">
-                  <span>Food name</span>
-                  <input
-                    type="text"
-                    value={foodForm.name}
-                    placeholder="Siggis Yogurt"
-                    onChange={(event) => updateFoodForm("name", event.target.value)}
-                  />
-                </label>
-
-                <div className="macro-input-grid">
-                  {MACRO_FIELDS.map((field) => (
-                    <label className="field" key={field.key}>
-                      <span>{field.label}</span>
-                      <input
-                        min="0"
-                        step="0.1"
-                        type="number"
-                        value={foodForm[field.key]}
-                        placeholder={
-                          field.key === "calories"
-                            ? "110"
-                            : field.key === "protein"
-                              ? "15"
-                              : field.key === "carbs"
-                                ? "13"
-                                : "0"
-                        }
-                        onChange={(event) => updateFoodForm(field.key, event.target.value)}
-                      />
-                    </label>
                   ))}
                 </div>
-
-                {formError && <p className="form-error">{formError}</p>}
-
-                <div className="form-actions">
-                  <button className="primary-button" type="submit">
-                    Save Food
-                  </button>
-                  <button
-                    className="secondary-button"
-                    type="button"
-                    onClick={() => createFood(true)}
-                  >
-                    Save + Log Today
-                  </button>
+              ) : (
+                <div className="empty-state">
+                  <strong>No items logged for this day.</strong>
+                  <span>Use the Add tab to log a saved food in seconds.</span>
                 </div>
-              </form>
+              )}
             </section>
-
-            <section className="panel" aria-labelledby="saved-foods-title">
-              <div className="panel-heading">
-                <div>
-                  <p className="eyebrow">Saved</p>
-                  <h2 id="saved-foods-title">{foods.length} Foods</h2>
+          ) : (
+            <section className="stats-grid">
+              <section className="flow-section" aria-labelledby="breakdown-title">
+                <div className="section-heading compact">
+                  <div>
+                    <p className="eyebrow">{periodLabel(period, statsDate)}</p>
+                    <h3 id="breakdown-title">Daily Breakdown</h3>
+                  </div>
                 </div>
 
-                <label className="search-field" htmlFor="library-food-search">
-                  <span>Search</span>
-                  <input
-                    id="library-food-search"
-                    type="search"
-                    value={libraryQuery}
-                    placeholder="Find a food"
-                    onChange={(event) => setLibraryQuery(event.target.value)}
-                  />
-                </label>
-              </div>
-
-              <div className="food-table" role="table" aria-label="Saved foods">
-                <div className="food-table-head" role="row">
-                  <span role="columnheader">Food</span>
-                  {MACRO_FIELDS.map((field) => (
-                    <span key={field.key} role="columnheader">
-                      {field.shortLabel}
-                    </span>
-                  ))}
-                  <span role="columnheader">Action</span>
-                </div>
-
-                {libraryFoods.length === 0 ? (
-                  <p className="empty-state">No saved foods match that search.</p>
+                {visibleDailyBreakdown.length > 0 ? (
+                  <div className="breakdown-list">
+                    {visibleDailyBreakdown.map((row) => (
+                      <article className="breakdown-row" key={row.date}>
+                        <div>
+                          <strong>{readableDate(row.date)}</strong>
+                          <span>
+                            {row.entryCount === 1
+                              ? "1 item"
+                              : `${row.entryCount} items`}
+                          </span>
+                        </div>
+                        <dl>
+                          {MACRO_FIELDS.map((field) => (
+                            <div key={field.key}>
+                              <dt>{field.shortLabel}</dt>
+                              <dd>
+                                {cleanNumber(row.totals[field.key])}
+                                {field.unit}
+                              </dd>
+                            </div>
+                          ))}
+                        </dl>
+                      </article>
+                    ))}
+                  </div>
                 ) : (
-                  libraryFoods.map((food) => (
-                    <article className="food-row" role="row" key={food.id}>
-                      <strong role="cell">{food.name}</strong>
-                      {MACRO_FIELDS.map((field) => (
-                        <span role="cell" key={field.key}>
-                          {cleanNumber(food[field.key])}
-                          {field.unit}
-                        </span>
-                      ))}
-                      <div className="row-actions" role="cell">
-                        <button
-                          className="mini-button"
-                          type="button"
-                          onClick={() => addEntry(food)}
-                        >
-                          Log
-                        </button>
-                        <button
-                          className="icon-button"
-                          type="button"
-                          aria-label={`Delete ${food.name}`}
-                          title={`Delete ${food.name}`}
-                          onClick={() => removeFood(food.id)}
-                        >
-                          x
-                        </button>
-                      </div>
-                    </article>
-                  ))
+                  <div className="empty-state">
+                    <strong>No logged days in this month.</strong>
+                    <span>Add foods for any date and they will appear here.</span>
+                  </div>
                 )}
-              </div>
+              </section>
+
+              <section className="flow-section" aria-labelledby="top-foods-title">
+                <div className="section-heading compact">
+                  <div>
+                    <p className="eyebrow">Most calories</p>
+                    <h3 id="top-foods-title">Top Foods</h3>
+                  </div>
+                </div>
+
+                {topFoods.length > 0 ? (
+                  <div className="top-food-list">
+                    {topFoods.map((food) => (
+                      <article className="top-food-row" key={food.name}>
+                        <div>
+                          <strong>{food.name}</strong>
+                          <span>{cleanNumber(food.servings)} servings</span>
+                        </div>
+                        <b>{cleanNumber(food.calories)} cal</b>
+                      </article>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="empty-state small">
+                    <strong>No top foods yet.</strong>
+                    <span>Log items in this period to see what shows up most.</span>
+                  </div>
+                )}
+              </section>
             </section>
-          </div>
-        </section>
-      )}
-
-      {activeTab === "week" && (
-        <section className="tab-panel" aria-labelledby="weekly-title">
-          <div className="section-intro">
-            <div>
-              <p className="eyebrow">Last 7 days</p>
-              <h2 id="weekly-title">Weekly Totals</h2>
-            </div>
-          </div>
-
-          <section className="totals-strip" aria-label="Weekly totals">
-            {MACRO_FIELDS.map((field) => (
-              <article className={`total-tile macro-${field.key}`} key={field.key}>
-                <div className="metric-label">{field.label}</div>
-                <strong>
-                  {cleanNumber(weeklyTotals[field.key])}
-                  {field.unit && <span>{field.unit}</span>}
-                </strong>
-                <small>7-day total</small>
-              </article>
-            ))}
-          </section>
-
-          <section className="panel weekly-panel">
-            <div className="week-table" role="table" aria-label="Weekly macro totals">
-              {weeklyRows.map((row) => (
-                <article className="week-row" role="row" key={row.date}>
-                  <strong role="cell">{readableDate(row.date)}</strong>
-                  <span role="cell">{cleanNumber(row.totals.calories)} cal</span>
-                  <span role="cell">{cleanNumber(row.totals.protein)}g pro</span>
-                  <span role="cell">{cleanNumber(row.totals.carbs)}g carb</span>
-                  <span role="cell">{cleanNumber(row.totals.fat)}g fat</span>
-                </article>
-              ))}
-
-              <article className="week-row total" role="row">
-                <strong role="cell">Total</strong>
-                <span role="cell">{cleanNumber(weeklyTotals.calories)} cal</span>
-                <span role="cell">{cleanNumber(weeklyTotals.protein)}g pro</span>
-                <span role="cell">{cleanNumber(weeklyTotals.carbs)}g carb</span>
-                <span role="cell">{cleanNumber(weeklyTotals.fat)}g fat</span>
-              </article>
-            </div>
-          </section>
-        </section>
-      )}
-
-      {activeTab === "targets" && (
-        <section className="tab-panel" aria-labelledby="targets-title">
-          <div className="section-intro">
-            <div>
-              <p className="eyebrow">Daily goals</p>
-              <h2 id="targets-title">Targets</h2>
-            </div>
-          </div>
-
-          <form className="panel targets-panel" onSubmit={handleTargetsSubmit}>
-            <div className="target-grid">
-              {MACRO_FIELDS.map((field) => (
-                <label className={`field target-field macro-${field.key}`} key={field.key}>
-                  <span>{field.label}</span>
-                  <input
-                    min="0"
-                    step="1"
-                    type="number"
-                    value={targets[field.key] || ""}
-                    onChange={(event) => updateTarget(field.key, event.target.value)}
-                  />
-                </label>
-              ))}
-            </div>
-            <div className="form-actions single-action">
-              <button className="primary-button" type="submit">
-                Save Targets
-              </button>
-            </div>
-          </form>
+          )}
         </section>
       )}
     </main>
