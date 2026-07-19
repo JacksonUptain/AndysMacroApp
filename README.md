@@ -26,6 +26,8 @@ The web Firebase config is already in [app/firebase.ts](./app/firebase.ts). Fire
 2. In Authentication > Settings > Authorized domains, add `localhost`, your GitHub Pages domain such as `your-user-name.github.io`, and any custom domain you attach later.
 3. In Realtime Database > Rules, publish the rules from [firebase.database.rules.json](./firebase.database.rules.json).
 
+For mobile testing against a dev server on your Mac, open the app with a URL whose domain is listed in Firebase Authentication > Settings > Authorized domains. If you use your Mac's LAN IP, add that exact IP there. The app uses popup sign-in first because Firebase redirect sign-in can fail on mobile browsers when the app is hosted somewhere other than the Firebase auth domain.
+
 You can also deploy the rules from this repo:
 
 ```bash

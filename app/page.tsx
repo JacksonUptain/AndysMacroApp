@@ -13,9 +13,11 @@ import { onValue, ref, set } from "firebase/database";
 import { useEffect, useMemo, useState } from "react";
 import {
   firebaseAuth,
+  firebaseAuthDomain,
   firebaseDatabase,
   googleAuthProvider,
   initializeFirebaseAnalytics,
+  prepareFirebaseAuth,
 } from "./firebase";
 
 type MacroKey = "calories" | "carbs" | "fat" | "protein";
@@ -382,14 +384,16 @@ function userMacroStatePath(uid: string) {
   return `users/${uid}/macroState`;
 }
 
-function shouldUseRedirectSignIn() {
+function canUseRedirectSignIn() {
   if (typeof window === "undefined") {
     return false;
   }
 
+  const { hostname } = window.location;
   return (
-    window.matchMedia("(display-mode: standalone)").matches ||
-    /Android|iPhone|iPad|iPod/i.test(window.navigator.userAgent)
+    hostname === "localhost" ||
+    hostname === "127.0.0.1" ||
+    hostname === firebaseAuthDomain
   );
 }
 
@@ -404,6 +408,33 @@ function shouldRetryWithRedirect(error: unknown) {
     code === "auth/cancelled-popup-request" ||
     code === "auth/operation-not-supported-in-this-environment"
   );
+}
+
+function authErrorMessage(error: unknown) {
+  const fallback = "Google sign-in could not start.";
+  if (!error || typeof error !== "object" || !("code" in error)) {
+    return fallback;
+  }
+
+  const code = String((error as { code?: unknown }).code);
+
+  if (code === "auth/popup-blocked") {
+    return "Your browser blocked the Google sign-in window. Allow pop-ups for this site and try again.";
+  }
+
+  if (code === "auth/popup-closed-by-user") {
+    return "Google sign-in was closed before it finished.";
+  }
+
+  if (code === "auth/unauthorized-domain") {
+    return "This domain is not authorized in Firebase Authentication yet.";
+  }
+
+  if (code === "auth/network-request-failed") {
+    return "Google sign-in could not reach Firebase. Check your connection and try again.";
+  }
+
+  return fallback;
 }
 
 function userInitials(user: User) {
@@ -431,6 +462,7 @@ export default function Home() {
   const [datesReady, setDatesReady] = useState(false);
   const [user, setUser] = useState<User | null>(null);
   const [authReady, setAuthReady] = useState(false);
+  const [redirectReady, setRedirectReady] = useState(false);
   const [authAction, setAuthAction] = useState(false);
   const [remoteReady, setRemoteReady] = useState(false);
   const [syncState, setSyncState] = useState<SyncState>("checking");
@@ -459,12 +491,17 @@ export default function Home() {
       }
     });
 
-    void getRedirectResult(firebaseAuth).catch(() => {
-      setNotice({
-        message: "Google sign-in could not finish. Try again.",
-        tone: "error",
-      });
-    });
+    void prepareFirebaseAuth()
+      .then(() => getRedirectResult(firebaseAuth))
+      .catch((error: unknown) => {
+        const message = authErrorMessage(error);
+        setSyncError(message);
+        setNotice({
+          message,
+          tone: "error",
+        });
+      })
+      .finally(() => setRedirectReady(true));
 
     return unsubscribe;
   }, []);
@@ -662,8 +699,10 @@ export default function Home() {
       ? dailyBreakdown.filter((row) => row.entryCount > 0)
       : dailyBreakdown;
 
+  const authFlowReady = authReady && redirectReady;
+
   const syncStatusLabel = useMemo(() => {
-    if (!authReady || syncState === "checking") {
+    if (!authFlowReady || syncState === "checking") {
       return "Opening";
     }
 
@@ -684,7 +723,7 @@ export default function Home() {
     }
 
     return "Saved";
-  }, [authReady, syncState, user]);
+  }, [authFlowReady, syncState, user]);
 
   const accountName = user?.displayName ?? user?.email ?? "Account required";
 
@@ -727,21 +766,20 @@ export default function Home() {
 
   async function signInWithGoogle() {
     setAuthAction(true);
+    setSyncError("");
 
     try {
-      if (shouldUseRedirectSignIn()) {
-        await signInWithRedirect(firebaseAuth, googleAuthProvider);
-        return;
-      }
-
+      await prepareFirebaseAuth();
       await signInWithPopup(firebaseAuth, googleAuthProvider);
     } catch (error) {
-      if (shouldRetryWithRedirect(error)) {
+      if (shouldRetryWithRedirect(error) && canUseRedirectSignIn()) {
         await signInWithRedirect(firebaseAuth, googleAuthProvider);
         return;
       }
 
-      showNotice("Google sign-in could not start.", "error");
+      const message = authErrorMessage(error);
+      setSyncError(message);
+      showNotice(message, "error");
     } finally {
       setAuthAction(false);
     }
@@ -912,15 +950,15 @@ export default function Home() {
     );
   }
 
-  if (!datesReady || !authReady || !user || !remoteReady || syncState === "error") {
-    const gateTitle = !datesReady || !authReady
+  if (!datesReady || !authFlowReady || !user || !remoteReady || syncState === "error") {
+    const gateTitle = !datesReady || !authFlowReady
       ? "Checking sign-in"
       : !user
         ? "Sign in to continue"
         : syncState === "error"
           ? "Account data needs attention"
           : "Loading your macro counter";
-    const gateCopy = !datesReady || !authReady
+    const gateCopy = !datesReady || !authFlowReady
       ? "One moment while your account status is checked."
       : !user
         ? "Use Google to open your food list, logs, and stats."
@@ -952,7 +990,7 @@ export default function Home() {
             <button
               className="primary-button auth-button"
               type="button"
-              disabled={!authReady || authAction}
+              disabled={!authFlowReady || authAction}
               onClick={signInWithGoogle}
             >
               Sign in with Google

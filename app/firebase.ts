@@ -1,5 +1,10 @@
 import { getApp, getApps, initializeApp } from "firebase/app";
-import { getAuth, GoogleAuthProvider } from "firebase/auth";
+import {
+  browserLocalPersistence,
+  getAuth,
+  GoogleAuthProvider,
+  setPersistence,
+} from "firebase/auth";
 import { getDatabase } from "firebase/database";
 import type { Analytics } from "firebase/analytics";
 
@@ -16,6 +21,7 @@ const firebaseConfig = {
 
 export const firebaseDatabaseUrl =
   "https://andrews-macro-counter-default-rtdb.firebaseio.com";
+export const firebaseAuthDomain = firebaseConfig.authDomain;
 
 export const firebaseApp = getApps().length ? getApp() : initializeApp(firebaseConfig);
 export const firebaseAuth = getAuth(firebaseApp);
@@ -25,6 +31,20 @@ export const googleAuthProvider = new GoogleAuthProvider();
 googleAuthProvider.setCustomParameters({ prompt: "select_account" });
 
 let analyticsPromise: Promise<Analytics | null> | null = null;
+let authPersistencePromise: Promise<void> | null = null;
+
+export function prepareFirebaseAuth() {
+  if (typeof window === "undefined") {
+    return Promise.resolve();
+  }
+
+  authPersistencePromise ??= setPersistence(
+    firebaseAuth,
+    browserLocalPersistence,
+  ).catch(() => undefined);
+
+  return authPersistencePromise;
+}
 
 export function initializeFirebaseAnalytics() {
   if (typeof window === "undefined") {
